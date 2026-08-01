@@ -1389,6 +1389,154 @@ fn terminal_origin_reset_resets_scroll_region_origin_without_destructive_clear()
     );
 }
 
+const HIDE_CURSOR_BYTES: &[u8] = b"\x1b[?25l";
+const SHOW_CURSOR_BYTES: &[u8] = b"\x1b[?25h";
+const CLEAR_SCREEN_BYTES: &[u8] = b"\x1b[2J";
+
+fn captured_app_terminal(
+    width: u16,
+    height: u16,
+) -> (Terminal<ColorCompatBackend<CapturedTrace>>, CapturedTrace) {
+    let output = CapturedTrace::default();
+    let mut backend = ColorCompatBackend::new(
+        output.clone(),
+        crate::palette::ColorDepth::TrueColor,
+        crate::palette::PaletteMode::Dark,
+    );
+    backend.force_size(Size::new(width, height));
+    let terminal = Terminal::new(backend).expect("captured app terminal");
+    (terminal, output)
+}
+
+fn frame_test_app(synchronized_output_enabled: bool, input: &str) -> App {
+    let mut app = create_test_app();
+    app.onboarding = OnboardingState::None;
+    app.launch.visible = false;
+    app.synchronized_output_enabled = synchronized_output_enabled;
+    app.input = input.to_string();
+    app.cursor_position = app.input.chars().count();
+    app
+}
+
+fn byte_sequence_position(output: &[u8], sequence: &[u8]) -> usize {
+    output
+        .windows(sequence.len())
+        .position(|window| window == sequence)
+        .unwrap_or_else(|| {
+            panic!(
+                "terminal output did not contain {sequence:?}: {:?}",
+                String::from_utf8_lossy(output)
+            )
+        })
+}
+
+fn expected_composer_cursor(app: &App) -> (u16, u16) {
+    let area = app
+        .viewport
+        .last_composer_area
+        .expect("production render records the composer area");
+    ComposerWidget::new(app, u16::MAX, &[], &[])
+        .cursor_pos(area)
+        .expect("composer exposes its cursor position")
+}
+
+fn assert_frame_restores_composer_cursor(output: &[u8], app: &App) {
+    let (cursor_x, cursor_y) = expected_composer_cursor(app);
+    let final_cursor = format!("\x1b[{};{}H", cursor_y + 1, cursor_x + 1);
+    let show_position = byte_sequence_position(output, SHOW_CURSOR_BYTES);
+    let final_cursor_position = output
+        .windows(final_cursor.len())
+        .rposition(|window| window == final_cursor.as_bytes())
+        .expect("frame ends by positioning the visible cursor at the composer");
+
+    assert!(
+        show_position < final_cursor_position,
+        "ratatui must restore visibility and then apply the composer cursor: {:?}",
+        String::from_utf8_lossy(output)
+    );
+    let trailing_output = &output[final_cursor_position + final_cursor.len()..];
+    assert!(
+        trailing_output.is_empty() || trailing_output == END_SYNC_UPDATE,
+        "the composer position must be the frame's final cursor movement: {:?}",
+        String::from_utf8_lossy(trailing_output)
+    );
+    assert!(
+        !output[show_position + SHOW_CURSOR_BYTES.len()..]
+            .windows(HIDE_CURSOR_BYTES.len())
+            .any(|window| window == HIDE_CURSOR_BYTES),
+        "a successful frame must leave the composer cursor visible"
+    );
+}
+
+#[test]
+fn app_frame_incremental_draw_hides_cursor_without_sync_output() {
+    let mut app = frame_test_app(false, "");
+    let config = Config::default();
+    let (mut terminal, output) = captured_app_terminal(50, 16);
+
+    draw_app_frame_inner(&mut terminal, &mut app, &config, false)
+        .expect("initial production frame");
+    output.clear();
+    app.input = "incremental Z redraw".to_string();
+    app.cursor_position = app.input.chars().count();
+
+    draw_app_frame_inner(&mut terminal, &mut app, &config, false)
+        .expect("incremental production frame");
+    let output = output.bytes();
+
+    assert!(
+        output.starts_with(HIDE_CURSOR_BYTES),
+        "cursor must be hidden before the first incremental diff command: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_frame_restores_composer_cursor(&output, &app);
+}
+
+#[test]
+fn app_frame_full_repaint_hides_cursor_before_origin_reset_and_clear() {
+    let mut app = frame_test_app(true, "");
+    let config = Config::default();
+    let (mut terminal, output) = captured_app_terminal(50, 16);
+
+    draw_app_frame_inner(&mut terminal, &mut app, &config, true).expect("full production repaint");
+    let output = output.bytes();
+    let hide_position = byte_sequence_position(&output, HIDE_CURSOR_BYTES);
+    let origin_reset_position = byte_sequence_position(&output, TERMINAL_ORIGIN_RESET);
+    let clear_position = byte_sequence_position(&output, CLEAR_SCREEN_BYTES);
+
+    assert!(
+        hide_position < origin_reset_position && origin_reset_position < clear_position,
+        "cursor hiding must precede the reset and clear sequence: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_frame_restores_composer_cursor(&output, &app);
+}
+
+#[test]
+fn app_frame_empty_and_wrapped_cjk_composers_finish_at_existing_geometry() {
+    for input in ["", "输入法候选窗口需要稳定地跟随这一段换行中文"] {
+        let mut app = frame_test_app(false, input);
+        let config = Config::default();
+        let (mut terminal, output) = captured_app_terminal(24, 12);
+
+        draw_app_frame_inner(&mut terminal, &mut app, &config, false)
+            .expect("production frame with composer geometry");
+
+        if !input.is_empty() {
+            let composer_width = app
+                .viewport
+                .last_composer_area
+                .expect("composer area")
+                .width;
+            assert!(
+                input.width() > usize::from(composer_width),
+                "CJK fixture must exercise wrapped display width"
+            );
+        }
+        assert_frame_restores_composer_cursor(&output.bytes(), &app);
+    }
+}
+
 #[test]
 fn composer_newline_shortcuts_do_not_steal_ctrl_enter() {
     assert!(is_composer_newline_key(KeyEvent::new(
@@ -2864,12 +3012,9 @@ fn create_test_app() -> App {
 #[derive(Clone, Default)]
 struct CapturedTrace(Arc<Mutex<Vec<u8>>>);
 
-struct CapturedTraceWriter(CapturedTrace);
-
-impl std::io::Write for CapturedTraceWriter {
+impl std::io::Write for CapturedTrace {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.0
-            .0
             .lock()
             .expect("captured trace lock")
             .extend_from_slice(buf);
@@ -2882,6 +3027,14 @@ impl std::io::Write for CapturedTraceWriter {
 }
 
 impl CapturedTrace {
+    fn bytes(&self) -> Vec<u8> {
+        self.0.lock().expect("captured trace lock").clone()
+    }
+
+    fn clear(&self) {
+        self.0.lock().expect("captured trace lock").clear();
+    }
+
     fn record(&self, action: impl FnOnce()) -> String {
         let writer = self.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -2889,7 +3042,7 @@ impl CapturedTrace {
             .without_time()
             .with_max_level(tracing::Level::DEBUG)
             .with_target(false)
-            .with_writer(move || CapturedTraceWriter(writer.clone()))
+            .with_writer(move || writer.clone())
             .finish();
         let dispatch = tracing::Dispatch::new(subscriber);
         tracing::dispatcher::with_default(&dispatch, action);

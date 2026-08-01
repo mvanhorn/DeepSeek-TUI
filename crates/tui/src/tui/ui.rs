@@ -14085,9 +14085,12 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
 /// complete frame instead of a blank intermediate frame followed by the UI.
 ///
 /// When `full_repaint` is false, only the diff from the previous draw is
-/// written (normal incremental update path).
-fn draw_app_frame_inner(
-    terminal: &mut AppTerminal,
+/// written (normal incremental update path). In both cases the physical
+/// cursor is hidden before drawing so terminal emulators cannot use ratatui's
+/// intermediate diff positions as the IME candidate-window anchor. The frame's
+/// cursor assignment restores visibility at the final composer position.
+fn draw_app_frame_inner<W: Write>(
+    terminal: &mut Terminal<ColorCompatBackend<W>>,
     app: &mut App,
     config: &Config,
     full_repaint: bool,
@@ -14109,6 +14112,7 @@ fn draw_app_frame_inner(
     // failing `?` would return early and leave the terminal stuck in
     // synchronized-update mode (screen frozen).
     let result = (|| -> Result<()> {
+        terminal.hide_cursor()?;
         if full_repaint {
             terminal.backend_mut().write_all(TERMINAL_ORIGIN_RESET)?;
             terminal.clear()?;
