@@ -3345,7 +3345,10 @@ fn fleet_roster_with(id: &str, profile: codewhale_config::FleetProfile) -> Fleet
 /// A roster with a single explicit member and no personal/workspace profiles.
 /// Used for tests that resolve by role name (e.g. `type: "builder"`) and must
 /// not be shadowed by the operator's personal `~/.codewhale/agents/*.toml`.
-fn isolated_fleet_roster_with(id: &str, mut profile: codewhale_config::FleetProfile) -> FleetRoster {
+fn isolated_fleet_roster_with(
+    id: &str,
+    mut profile: codewhale_config::FleetProfile,
+) -> FleetRoster {
     if profile.role.name.trim().is_empty() {
         profile.role.name = id.to_string();
     }
@@ -3743,15 +3746,15 @@ fn spawn_route_sources_refresh_reads_current_disk() {
 }
 
 #[test]
-fn test_child_max_spawn_depth_profile_hint_only_narrows() {
-    // Profile hint narrows the inherited budget...
+fn test_child_max_spawn_depth_never_widens_inherited_budget() {
+    // Profile hint narrows the inherited budget.
     assert_eq!(child_max_spawn_depth_for_spawn(3, 1, None, Some(1)), 2);
-    // ...but never widens it.
+    // A profile hint above the inherited budget cannot widen it.
     assert_eq!(child_max_spawn_depth_for_spawn(2, 0, None, Some(6)), 2);
-    // Explicit request takes the min with the hint.
+    // Explicit request takes the min with the hint, then the inherited budget.
     assert_eq!(child_max_spawn_depth_for_spawn(2, 0, Some(3), Some(1)), 1);
-    // Explicit request alone keeps its existing widen-up-to-ceiling semantics.
-    assert_eq!(child_max_spawn_depth_for_spawn(2, 0, Some(3), None), 3);
+    // An explicit request above the inherited budget cannot widen it either.
+    assert_eq!(child_max_spawn_depth_for_spawn(2, 0, Some(3), None), 2);
     assert_eq!(
         child_max_spawn_depth_for_spawn(
             2,
@@ -3759,10 +3762,18 @@ fn test_child_max_spawn_depth_profile_hint_only_narrows() {
             Some(codewhale_config::MAX_SPAWN_DEPTH_CEILING),
             None
         ),
-        codewhale_config::MAX_SPAWN_DEPTH_CEILING
+        2
     );
+    // Explicit and profile limits below the inherited cap still narrow it.
+    assert_eq!(child_max_spawn_depth_for_spawn(6, 2, Some(2), None), 4);
+    assert_eq!(child_max_spawn_depth_for_spawn(6, 2, Some(3), Some(1)), 3);
     // Neither request nor hint: inherit unchanged.
     assert_eq!(child_max_spawn_depth_for_spawn(5, 2, None, None), 5);
+    // Boundary inputs saturate and remain bounded by both caps.
+    assert_eq!(
+        child_max_spawn_depth_for_spawn(u32::MAX, u32::MAX, Some(u32::MAX), None),
+        codewhale_config::MAX_SPAWN_DEPTH_CEILING
+    );
 }
 
 #[test]
@@ -4052,9 +4063,18 @@ fn apply_spawn_profile_promoted_alias_rejects_model_mismatch() {
     let err = apply_spawn_profile(&mut request, &roster)
         .expect_err("mismatched model on promoted profile must fail");
     let message = err.to_string();
-    assert!(message.contains("builder"), "error must name the member: {message}");
-    assert!(message.contains("deepseek-v4-pro"), "error must name the pinned model: {message}");
-    assert!(message.contains("deepseek-v4-flash"), "error must name the requested model: {message}");
+    assert!(
+        message.contains("builder"),
+        "error must name the member: {message}"
+    );
+    assert!(
+        message.contains("deepseek-v4-pro"),
+        "error must name the pinned model: {message}"
+    );
+    assert!(
+        message.contains("deepseek-v4-flash"),
+        "error must name the requested model: {message}"
+    );
 }
 
 /// A Fleet worker subprocess launches as `--model <exact> --reasoning-effort
@@ -5711,6 +5731,116 @@ fn test_subagent_tools_respect_nested_agent_depth_budget() {
         "child should lose agent launcher at configured depth cap; tools: {capped_names:?}"
     );
     assert!(!capped.is_tool_allowed("agent"));
+}
+
+#[tokio::test]
+async fn inherited_depth_budget_survives_descendant_max_depth_request() {
+    let tmp = tempdir().expect("tempdir");
+    let (client, _, _) = delayed_chat_client(Duration::ZERO, "done").await;
+    let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
+
+    let mut root = stub_runtime();
+    root.client = client;
+    root.manager = Arc::clone(&manager);
+    root.context = ToolContext::new(tmp.path().to_path_buf());
+    root.spawn_depth = 0;
+    root.max_spawn_depth = 2;
+
+    let mut child = root.background_runtime();
+    child.max_spawn_depth =
+        child_max_spawn_depth_for_spawn(child.max_spawn_depth, child.spawn_depth, None, None);
+    assert_eq!((child.spawn_depth, child.max_spawn_depth), (1, 2));
+    let child_registry = SubAgentToolRegistry::new(
+        child.clone(),
+        FleetRole::Scout,
+        None,
+        Arc::new(Mutex::new(TodoList::new())),
+        Arc::new(Mutex::new(PlanState::default())),
+    );
+    assert!(
+        child_registry
+            .tools_for_model(&FleetRole::Scout)
+            .iter()
+            .any(|tool| tool.name == "agent"),
+        "depth-1 child should advertise the launcher for its allowed grandchild"
+    );
+    assert!(child_registry.is_tool_allowed("agent"));
+
+    let spawn = AgentTool::new(Arc::clone(&manager), child.clone())
+        .execute(
+            json!({
+                "prompt": "inspect the inherited depth budget",
+                "type": "scout",
+                "max_depth": 8
+            }),
+            &child.context,
+        )
+        .await
+        .expect("depth-1 child should invoke the launcher for a grandchild");
+    let grandchild_id = spawn
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("agent_id"))
+        .and_then(Value::as_str)
+        .expect("spawn receipt should identify the grandchild");
+    let admitted = manager
+        .read()
+        .await
+        .get_worker_record(grandchild_id)
+        .expect("admitted grandchild should have a worker record");
+    assert_eq!(
+        (admitted.spec.spawn_depth, admitted.spec.max_spawn_depth),
+        (2, 2),
+        "production spawn must preserve the root's absolute cap"
+    );
+
+    let mut grandchild = child.background_runtime();
+    grandchild.max_spawn_depth = child_max_spawn_depth_for_spawn(
+        grandchild.max_spawn_depth,
+        grandchild.spawn_depth,
+        Some(8),
+        None,
+    );
+    assert_eq!(
+        (grandchild.spawn_depth, grandchild.max_spawn_depth),
+        (2, 2),
+        "descendant request must preserve the root's absolute cap"
+    );
+    let grandchild_registry = SubAgentToolRegistry::new(
+        grandchild.clone(),
+        FleetRole::Scout,
+        None,
+        Arc::new(Mutex::new(TodoList::new())),
+        Arc::new(Mutex::new(PlanState::default())),
+    );
+    assert!(
+        !grandchild_registry
+            .tools_for_model(&FleetRole::Scout)
+            .iter()
+            .any(|tool| tool.name == "agent"),
+        "depth-2 grandchild must not advertise a launcher beyond the root cap"
+    );
+    assert!(!grandchild_registry.is_tool_allowed("agent"));
+
+    let (blocked_client, blocked_model_calls, _) =
+        delayed_chat_client(Duration::ZERO, "must not run").await;
+    grandchild.client = blocked_client;
+    let error = spawn_subagent_from_input(
+        json!({"prompt": "attempt forbidden depth-3 spawn", "max_depth": 8}),
+        manager,
+        grandchild,
+    )
+    .await
+    .expect_err("depth-3 spawn must fail at admission");
+    assert!(
+        error.to_string().contains("Sub-agent depth limit reached"),
+        "existing depth-limit error should be preserved: {error}"
+    );
+    assert_eq!(
+        blocked_model_calls.load(Ordering::SeqCst),
+        0,
+        "depth admission must reject before contacting the model"
+    );
 }
 
 fn tool_names(tools: Vec<Tool>) -> HashSet<String> {

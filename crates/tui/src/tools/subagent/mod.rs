@@ -11831,9 +11831,9 @@ fn resolve_fixed_spawn_model_route(
 
 /// Effective absolute `max_spawn_depth` for a child, combining the inherited
 /// runtime budget, the caller's `max_depth` request, and a fleet profile's
-/// `delegation.max_spawn_depth` hint. An explicit request keeps its existing
-/// semantics (may widen up to the ceiling); a profile hint only narrows —
-/// either the request (min) or the inherited budget.
+/// `delegation.max_spawn_depth` hint. Requests and profile hints are
+/// child-relative limits: after conversion to an absolute cap, they may narrow
+/// but never widen the authoritative inherited absolute budget.
 fn child_max_spawn_depth_for_spawn(
     inherited: u32,
     child_spawn_depth: u32,
@@ -11843,7 +11843,7 @@ fn child_max_spawn_depth_for_spawn(
     match (requested, profile_hint) {
         (Some(requested), hint) => {
             let depth = hint.map_or(requested, |hint| requested.min(hint));
-            clamp_child_max_spawn_depth(child_spawn_depth, depth)
+            inherited.min(clamp_child_max_spawn_depth(child_spawn_depth, depth))
         }
         (None, Some(hint)) => inherited.min(clamp_child_max_spawn_depth(child_spawn_depth, hint)),
         (None, None) => inherited,
